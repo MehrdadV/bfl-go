@@ -2,7 +2,6 @@ package bfl
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,7 +13,7 @@ import (
 
 const defaultBaseURL = "https://api.bfl.ai"
 
-const maxJSONResponseBytes = 8 << 20
+const maxJSONResponseBytes = 8 << 20 // 8 MiB
 
 // Client is a concurrency-safe client for the Black Forest Labs API.
 type Client struct {
@@ -98,7 +97,8 @@ func WithAPIKey(key string) ClientOption {
 }
 
 // WithHTTPClient sets the HTTP client used for API and media requests.
-// The caller's client, including its timeout and transport, is used as-is.
+// Authenticated redirects are blocked; media redirects are restricted to
+// trusted HTTPS delivery hosts and do not send a Referer header.
 func WithHTTPClient(client *http.Client) ClientOption {
 	return func(cfg *clientConfig) error {
 		if client == nil {
@@ -128,7 +128,9 @@ type RetryPolicy struct {
 	// Zero disables retries and makes safe requests run once.
 	MaxAttempts int
 	BaseDelay   time.Duration
-	MaxDelay    time.Duration
+	// MaxDelay caps backoff; zero uses the 30-second default cap. A server
+	// Retry-After value is honored even when it exceeds MaxDelay; the context bounds the wait.
+	MaxDelay time.Duration
 }
 
 // WithRetryPolicy sets bounded retry behavior for safe requests.
@@ -176,18 +178,17 @@ func WithPollTimeout(timeout time.Duration) ClientOption {
 
 func parseBaseURL(raw string) (*url.URL, error) {
 	u, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || u.Scheme == "" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+	if err != nil || !hasValidBaseURLComponents(u) {
 		return nil, fmt.Errorf("bfl: invalid API base URL %q", raw)
 	}
 	if u.Path != "" && u.Path != "/" {
 		return nil, errors.New("bfl: API base URL must not include a path")
 	}
 	host := strings.ToLower(u.Hostname())
-	loopback := host == "localhost" || host == "::1" || strings.HasPrefix(host, "127.")
-	if u.Scheme != "https" && !(u.Scheme == "http" && loopback) {
+	if !isAllowedBaseURLScheme(u.Scheme, isLoopbackHost(host)) {
 		return nil, errors.New("bfl: API base URL must use HTTPS (HTTP is allowed only on loopback)")
 	}
-	if u.Scheme == "https" && !(host == "bfl.ai" || strings.HasSuffix(host, ".bfl.ai")) {
+	if u.Scheme == "https" && !isBFLHost(host) {
 		return nil, errors.New("bfl: HTTPS API base URL must be a BFL host")
 	}
 	u.Path = ""
@@ -197,35 +198,70 @@ func parseBaseURL(raw string) (*url.URL, error) {
 	return u, nil
 }
 
+func hasValidBaseURLComponents(u *url.URL) bool {
+	return u != nil && u.Scheme != "" && u.Hostname() != "" && u.User == nil && u.RawQuery == "" && u.Fragment == ""
+}
+
+func isAllowedBaseURLScheme(scheme string, loopback bool) bool {
+	return scheme == "https" || (scheme == "http" && loopback)
+}
+
+func isLoopbackHost(host string) bool {
+	return host == "localhost" || host == "::1" || strings.HasPrefix(host, "127.")
+}
+
+func isBFLHost(host string) bool {
+	return host == "bfl.ai" || strings.HasSuffix(host, ".bfl.ai")
+}
+
+func isSuccessfulHTTPStatus(status int) bool {
+	return status >= http.StatusOK && status < http.StatusMultipleChoices
+}
+
+func isValidAPIPath(path string) bool {
+	return strings.HasPrefix(path, "/") && !strings.HasPrefix(path, "//")
+}
+
 // doJSON performs one API request, decodes a successful JSON response, and
 // returns structured errors for non-2xx responses. Retrying is deliberately
 // not implicit here; callers must opt into the safe-request retry helper.
-func (c *Client) doJSON(ctx context.Context, method, path string, body io.Reader, out any) error {
+func (c *Client) doJSON(ctx context.Context, method, path string, body io.Reader, out any) (retErr error) {
 	req, err := c.newRequest(ctx, method, path, body)
 	if err != nil {
 		return err
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.doAuthenticated(req)
 	if err != nil {
 		return fmt.Errorf("bfl: %s %s: %w", method, path, err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("bfl: close %s response body: %w", method, err))
+		}
+	}()
+	if !isSuccessfulHTTPStatus(resp.StatusCode) {
 		return decodeAPIError(resp)
 	}
 	if out == nil {
 		_, err = io.Copy(io.Discard, io.LimitReader(resp.Body, maxJSONResponseBytes))
 		return err
 	}
-	dec := json.NewDecoder(io.LimitReader(resp.Body, maxJSONResponseBytes+1))
-	if err := dec.Decode(out); err != nil {
+	if err := decodeLimitedJSON(resp.Body, out); err != nil {
 		return &ProtocolError{Operation: method + " " + path, Err: err}
 	}
 	return nil
 }
 
+func (c *Client) doAuthenticated(req *http.Request) (*http.Response, error) {
+	client := *c.httpClient
+	client.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return client.Do(req)
+}
+
 func (c *Client) newRequest(ctx context.Context, method, path string, body io.Reader) (*http.Request, error) {
-	if !strings.HasPrefix(path, "/") || strings.HasPrefix(path, "//") {
+	if !isValidAPIPath(path) {
 		return nil, fmt.Errorf("bfl: API path must be an absolute path, got %q", path)
 	}
 	u := *c.baseURL
@@ -245,16 +281,29 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body io.Re
 // validatePollingURL checks a BFL-issued URL before sending credentials to it.
 // Polling URLs may use another BFL cluster hostname, so allow HTTPS subdomains
 // of bfl.ai while preserving the exact URL returned by BFL.
-func validatePollingURL(raw string) (*url.URL, error) {
+func (c *Client) validatePollingURL(raw string) (*url.URL, error) {
 	u, err := url.Parse(raw)
-	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.Fragment != "" {
+	if err != nil {
+		return nil, fmt.Errorf("bfl: invalid polling URL")
+	}
+	if !hasValidPollingURLComponents(u) {
 		return nil, fmt.Errorf("bfl: invalid polling URL")
 	}
 	host := strings.ToLower(u.Hostname())
-	if host != "bfl.ai" && !strings.HasSuffix(host, ".bfl.ai") {
+	trustedBFLHost := isBFLHost(host)
+	trustedConfiguredHost := strings.EqualFold(u.Host, c.baseURL.Host) && u.Scheme == c.baseURL.Scheme
+	if !isTrustedPollingURL(u, trustedBFLHost, trustedConfiguredHost) {
 		return nil, errors.New("bfl: polling URL host is not a BFL domain")
 	}
 	return u, nil
+}
+
+func hasValidPollingURLComponents(u *url.URL) bool {
+	return u != nil && u.Scheme != "" && u.Hostname() != "" && u.User == nil && u.Fragment == ""
+}
+
+func isTrustedPollingURL(u *url.URL, trustedBFLHost, trustedConfiguredHost bool) bool {
+	return (u.Scheme == "https" && trustedBFLHost) || trustedConfiguredHost
 }
 
 type ImageService struct{ client *Client }
