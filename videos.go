@@ -231,7 +231,7 @@ func (m *Video) Bytes() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return os.ReadFile(path)
+	return os.ReadFile(path) // #nosec G304 -- Path is the SDK-created temporary media file.
 }
 
 // WriteTo streams the cached video to w.

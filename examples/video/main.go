@@ -18,7 +18,7 @@ func main() {
 }
 
 func run() (retErr error) {
-	if err := os.MkdirAll("outputs", 0o755); err != nil {
+	if err := os.MkdirAll("outputs", 0o755); err != nil { // #nosec G301 -- Example output directory is intentionally readable.
 		return fmt.Errorf("create outputs directory: %w", err)
 	}
 	client, err := bfl.New(bfl.WithAPIKey(os.Getenv("BFL_API_KEY")))
