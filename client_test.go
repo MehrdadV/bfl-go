@@ -195,7 +195,7 @@ func TestRetryInterruptedMedia(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				data, readErr := os.ReadFile(path)
+				data, readErr := os.ReadFile(path) // #nosec G304 -- Path was created in the test's temporary directory.
 				if readErr != nil || string(data) != "complete media" || contentType != "video/test" || size != int64(len(data)) {
 					t.Errorf("media = %q, type = %q, size = %d, error = %v", data, contentType, size, readErr)
 				}
@@ -298,7 +298,7 @@ func TestMediaRedirectSafety(t *testing.T) {
 		{name: "Azure host", location: "https://bfldelivery123.blob.core.windows.net/media", wantAllowed: true},
 		{name: "untrusted host", location: "https://other.example/media"},
 		{name: "HTTP downgrade", location: "http://delivery.bfl.ai/media"},
-		{name: "URL credentials", location: "https://user:password@delivery.bfl.ai/media"},
+		{name: "URL credentials", location: "https://user:password@delivery.bfl.ai/media"}, // #nosec G101 -- Test credentials are not real.
 		{name: "callback changes host", location: "https://delivery.bfl.ai/media", custom: true, changeHost: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

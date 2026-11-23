@@ -172,6 +172,16 @@ git config --local core.hooksPath .githooks
 ```
 
 The hook runs `golangci-lint` against the working tree and blocks the push if linting fails.
+CI runs tests, `go vet`, `govulncheck`, and `golangci-lint` with `gosec` enabled
+on pull requests and pushes to `main`. Keep the CI linter version in sync with
+`mise.toml`. The `Go CI` check is required by the `main` branch ruleset.
+
+To run the security checks locally:
+
+```sh
+mise exec -- env GOTOOLCHAIN=local go run golang.org/x/vuln/cmd/govulncheck@v1.10.0 ./...
+mise exec -- golangci-lint run --enable=gosec ./...
+```
 
 ## Compatibility
 

@@ -323,7 +323,7 @@ func (m *Image) Bytes() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return os.ReadFile(path)
+	return os.ReadFile(path) // #nosec G304 -- Path is the SDK-created temporary media file.
 }
 
 // WriteTo streams the cached image to w.
@@ -515,7 +515,7 @@ func writeFileTo(path string, w io.Writer) (n int64, retErr error) {
 	if w == nil {
 		return 0, errors.New("bfl: writer must not be nil")
 	}
-	f, err := os.Open(path)
+	f, err := os.Open(path) // #nosec G304 -- Path is the SDK-created temporary media file.
 	if err != nil {
 		return 0, err
 	}
@@ -540,7 +540,7 @@ func copyFileAtomically(source, destination string) (err error) {
 		}
 	}()
 
-	in, err := os.Open(source)
+	in, err := os.Open(source) // #nosec G304 -- Source is the SDK-created temporary media file.
 	if err != nil {
 		_ = tmp.Close()
 		return err
